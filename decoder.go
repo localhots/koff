@@ -1,10 +1,12 @@
 package koff
 
 import (
+	"context"
 	"encoding/binary"
-	"fmt"
 	"runtime/debug"
 	"time"
+
+	"github.com/localhots/gobelt/log"
 )
 
 // Message is the main structure that wraps a consumer offsets topic message.
@@ -38,8 +40,8 @@ type GroupMember struct {
 	ID               string
 	ClientID         string
 	ClientHost       string
-	SessionTimeout   int32
-	RebalanceTimeout int32
+	SessionTimeout   time.Duration
+	RebalanceTimeout time.Duration
 	Subscription     []TopicAndPartition
 	Assignment       []TopicAndPartition
 }
@@ -51,13 +53,24 @@ type TopicAndPartition struct {
 }
 
 // Decode decodes message key and value into an OffsetMessage.
-func Decode(key, val []byte) Message {
+func Decode(ctx context.Context, key, val []byte) Message {
 	var m Message
+	defer func() {
+		if err := recover(); err != nil {
+			log.Error(ctx, "Failed to decode group metadata", log.F{
+				"error":   err,
+				"payload": val,
+				"message": m,
+			})
+			debug.PrintStack()
+		}
+	}()
+
 	m.decodeKey(key)
 	if m.OffsetMessage != nil {
 		m.decodeOffsetMessage(val)
 	} else {
-		m.decodeGroupMetadata(val)
+		m.decodeGroupMetadata(ctx, val)
 	}
 
 	return m
@@ -105,14 +118,7 @@ func (m *Message) decodeOffsetMessage(val []byte) {
 	}
 }
 
-func (m *Message) decodeGroupMetadata(val []byte) {
-	defer func() {
-		if err := recover(); err != nil {
-			fmt.Println(err)
-			debug.PrintStack()
-			fmt.Println(val, m)
-		}
-	}()
+func (m *Message) decodeGroupMetadata(ctx context.Context, val []byte) {
 	buf := &buffer{data: val}
 	m.GroupMessage = &GroupMessage{Members: []GroupMember{}}
 	gm := m.GroupMessage
@@ -123,6 +129,9 @@ func (m *Message) decodeGroupMetadata(val []byte) {
 	gm.ProtocolType = buf.readString()
 	gm.GenerationID = buf.readInt32()
 	if gm.GenerationID > 1 {
+		// Messages with generation greater than one often lack remaining fields
+		// If followin sequence is like 0xFF 0xFF 0xFF 0xFF 0x00 0x00 ...
+		// then just skip that shit
 		next := buf.readInt32()
 		if next == -1 {
 			return
@@ -133,20 +142,18 @@ func (m *Message) decodeGroupMetadata(val []byte) {
 	gm.LeaderID = buf.readString()
 	gm.Protocol = buf.readString()
 
-	ary := buf.readInt32()
-	if ary == 0 {
-		return
+	arySize := int(buf.readInt32())
+	for i := 0; i < arySize; i++ {
+		gm.Members = append(gm.Members, GroupMember{
+			ID:               buf.readString(),
+			ClientID:         buf.readString(),
+			ClientHost:       buf.readString(),
+			SessionTimeout:   makeDur(buf.readInt32()),
+			RebalanceTimeout: makeDur(buf.readInt32()),
+			Subscription:     readAssignment(buf),
+			Assignment:       readAssignment(buf),
+		})
 	}
-
-	gm.Members = append(gm.Members, GroupMember{
-		ID:               buf.readString(),
-		ClientID:         buf.readString(),
-		ClientHost:       buf.readString(),
-		SessionTimeout:   buf.readInt32(),
-		RebalanceTimeout: buf.readInt32(),
-	})
-	gm.Members[0].Subscription = readAssignment(buf)
-	gm.Members[0].Assignment = readAssignment(buf)
 }
 
 func readAssignment(buf *buffer) []TopicAndPartition {
@@ -173,6 +180,10 @@ func readTopicAndSubscription(buf *buffer) TopicAndPartition {
 
 func makeTime(ts int64) time.Time {
 	return time.Unix(ts/1000, (ts%1000)*1000000)
+}
+
+func makeDur(to int32) time.Duration {
+	return time.Duration(to) * time.Millisecond
 }
 
 //

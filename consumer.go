@@ -20,6 +20,8 @@ type Consumer struct {
 	msgs   chan Message
 	watch  bool
 
+	ctx     context.Context
+	stopFn  func()
 	lock    sync.Mutex
 	wg      sync.WaitGroup
 	pticker *time.Ticker
@@ -27,25 +29,29 @@ type Consumer struct {
 
 // NewConsumer creates a new Kafka offsets topic consumer.
 func NewConsumer(brokers []string, watch bool) (*Consumer, error) {
-	log.Info(context.TODO(), "Creating client")
+	ctx := context.Background()
+	log.Info(ctx, "Creating client", log.F{"brokers": brokers})
 	client, err := sarama.NewClient(brokers, sarama.NewConfig())
 	if err != nil {
 		return nil, err
 	}
 
-	log.Info(context.TODO(), "Creating consumer")
+	log.Info(ctx, "Creating consumer")
 	sc, err := sarama.NewConsumerFromClient(client)
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	c := &Consumer{
 		client: client,
 		cons:   sc,
 		pcs:    make(map[int32]sarama.PartitionConsumer),
 		msgs:   make(chan Message),
 		watch:  watch,
+		ctx:    ctx,
+		stopFn: cancel,
 	}
-	log.Info(context.TODO(), "Setting up partition consumers")
+	log.Info(ctx, "Setting up partition consumers")
 	if err := c.setupPartitionConsumers(); err != nil {
 		return nil, err
 	}
@@ -65,6 +71,7 @@ func (c *Consumer) Messages() <-chan Message {
 
 // Close shuts down the consumer.
 func (c *Consumer) Close() error {
+	c.stopFn()
 	c.pticker.Stop()
 	for _, pc := range c.pcs {
 		if err := pc.Close(); err != nil {
@@ -81,13 +88,20 @@ func (c *Consumer) Close() error {
 
 func (c *Consumer) keepPartitionConsumersUpdated(interval time.Duration) {
 	c.pticker = time.NewTicker(interval)
-	for range c.pticker.C {
-		c.setupPartitionConsumers()
+	for {
+		select {
+		case <-c.pticker.C:
+			if err := c.setupPartitionConsumers(); err != nil {
+				log.Error(c.ctx, "Failed to setup update partition consumers", log.F{"error": err})
+			}
+		case <-c.ctx.Done():
+			return
+		}
 	}
 }
 
 func (c *Consumer) setupPartitionConsumers() error {
-	log.Info(context.TODO(), "Fetching partition list")
+	log.Info(c.ctx, "Fetching partition list")
 	partitions, err := c.cons.Partitions(topicName)
 	if err != nil {
 		return err
@@ -122,12 +136,12 @@ func (c *Consumer) setupPartitionConsumers() error {
 
 func (c *Consumer) consumePartition(partition int32) error {
 	defer c.wg.Done()
+	ctx := log.ContextWithFields(c.ctx, log.F{"partition": partition})
 
 	pc, err := c.cons.ConsumePartition(topicName, partition, sarama.OffsetOldest)
 	if err != nil {
 		return err
 	}
-	log.Info(context.TODO(), "Started partition consumer", log.F{"p": partition})
 
 	c.lock.Lock()
 	c.pcs[partition] = pc
@@ -135,6 +149,7 @@ func (c *Consumer) consumePartition(partition int32) error {
 
 	var maxOffset *int64
 	if c.watch {
+		log.Debug(ctx, "Fetching last offset")
 		off, err := c.client.GetOffset(topicName, partition, sarama.OffsetNewest)
 		if err != nil {
 			return err
@@ -142,11 +157,13 @@ func (c *Consumer) consumePartition(partition int32) error {
 		maxOffset = &off
 	}
 
+	log.Info(ctx, "Started partition consumer")
 	for msg := range pc.Messages() {
 		if msg.Value == nil {
 			continue
 		}
-		c.msgs <- Decode(msg.Key, msg.Value)
+		ctx := log.ContextWithFields(ctx, log.F{"offset": msg.Offset})
+		c.msgs <- Decode(ctx, msg.Key, msg.Value)
 		if maxOffset != nil && msg.Offset == *maxOffset {
 			return nil
 		}
