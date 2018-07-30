@@ -76,6 +76,11 @@ func Decode(ctx context.Context, key, val []byte) Message {
 	return m
 }
 
+// Complete returns true if message is complete.
+func (gm GroupMessage) Complete() bool {
+	return gm.LeaderID != ""
+}
+
 // Key structure:
 // [2] Version, uint16 big endian
 // [2] Consumer name length, uint16 big endian

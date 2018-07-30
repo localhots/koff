@@ -13,7 +13,7 @@ So far it is only cable of printing parsed messages. For usage eample take a
 look at the main command.
 
 ```
-go run cmd/main.go -brokers 127.0.0.1:9092
+go run cmd/printer/main.go -brokers 127.0.0.1:9092
 ```
 
 ### Design
